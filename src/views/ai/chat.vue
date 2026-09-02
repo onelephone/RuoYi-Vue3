@@ -121,10 +121,27 @@
                 <!-- AI：正常内容 -->
                 <div
                   v-else-if="msg.role === 'assistant'"
-                  class="markdown-body"
-                  :class="{ 'typing-cursor': msg.streaming }"
-                  v-html="renderMarkdown(msg.content)"
-                ></div>
+                  class="bubble-content"
+                >
+                  <!-- 流程执行过程（不带 [[PROCESS]] 前缀） -->
+                  <div v-if="msg.processSteps && msg.processSteps.length" class="process-steps">
+                    <div
+                      v-for="(step, si) in msg.processSteps"
+                      :key="si"
+                      class="process-step"
+                    >
+                      <span class="step-dot"></span>
+                      <span class="step-text">{{ step }}</span>
+                    </div>
+                  </div>
+                  <!-- 最终回复（打字机，content 可能含 HTML 表格） -->
+                  <div
+                    v-if="msg.content"
+                    class="markdown-body"
+                    :class="{ 'typing-cursor': msg.streaming }"
+                    v-html="renderFinalContent(msg.content)"
+                  ></div>
+                </div>
                 <!-- 用户：纯文本 -->
                 <span v-else class="user-text">{{ msg.content }}</span>
               </div>
@@ -231,6 +248,9 @@ const renameTargetId   = ref(null)
 let currentReader      = null
 let sseEventBuffer     = null   // 暂存 event: 行
 
+// 流程过程前缀：后端以 [[PROCESS]] 标记流程步骤，前端分流到流程区，不混入最终回复
+const PROCESS_MARKER = '[[PROCESS]]'
+
 // DOM refs
 const messagesAreaRef  = ref(null)
 const inputRef         = ref(null)
@@ -298,13 +318,19 @@ async function loadMessageList(convId) {
   try {
     const res = await listMessages(convId)
     if (res.code === 200) {
-      messages.value = (res.data || []).map(m => ({
-        role: m.role,
-        content: m.content,
-        loading: false,
-        streaming: false,
-        error: null
-      }))
+      messages.value = (res.data || []).map(m => {
+        // 历史消息可能把流程步骤与最终回复混在同一个 content 里，
+        // 这里剥离已知的流程步骤语句，剩余作为最终回复。
+        const parsed = splitProcessFromContent(m.content || '')
+        return {
+          role: m.role,
+          content: parsed.content,
+          processSteps: parsed.steps,
+          loading: false,
+          streaming: false,
+          error: null
+        }
+      })
       nextTick(() => { scrollToBottom(); focusInput() })
     }
   } catch {
@@ -383,11 +409,11 @@ async function handleSendMessage() {
   isStreaming.value = true
 
   // 追加用户气泡
-  messages.value.push({ role: 'user', content: text, loading: false, streaming: false, error: null })
+  messages.value.push({ role: 'user', content: text, loading: false, streaming: false, error: null, processSteps: [] })
 
   // 追加 AI loading 占位
   const aiIndex = messages.value.length
-  messages.value.push({ role: 'assistant', content: '', loading: true, streaming: false, error: null })
+  messages.value.push({ role: 'assistant', content: '', loading: true, streaming: false, error: null, processSteps: [] })
   nextTick(() => scrollToBottom())
 
   const baseUrl = import.meta.env.VITE_APP_BASE_API || ''
@@ -457,7 +483,25 @@ async function handleSendMessage() {
             }
             // 忽略流结束标记 [DONE]，不进入正文
             if (data === '[DONE]') continue
-            // message / done / 其他：一律当内容追加（不依赖 done 复位）
+            // 过程提示：优先以 [[PROCESS]] 前缀识别（规范、最可靠）；
+            // 同时兼容前缀被网关/历史存储丢失的情况，用内容正则兜底。
+            // 循环剥离可能出现多次的前缀（如 [[PROCESS]][[PROCESS]]...），避免残留。
+            let raw = data
+            let hasMarker = false
+            while (raw.startsWith(PROCESS_MARKER)) {
+              raw = raw.slice(PROCESS_MARKER.length)
+              hasMarker = true
+            }
+            if (hasMarker || isProcessStep(raw)) {
+              const stepText = raw.trim()
+              if (!stepText) continue
+              const cur = messages.value[aiIndex]
+              const steps = [...(cur.processSteps || []), stepText]
+              messages.value[aiIndex] = { ...cur, processSteps: steps }
+              nextTick(() => scrollToBottom())
+              continue
+            }
+            // 其余内容：视为最终回复（可能含 HTML 表格），打字机式追加
             const cur = messages.value[aiIndex]
             messages.value[aiIndex] = { ...cur, content: cur.content + data }
             nextTick(() => scrollToBottom())
@@ -477,7 +521,7 @@ async function handleSendMessage() {
     }
     const errMsg = e.message || '服务异常，请重试'
     messages.value[aiIndex] = {
-      role: 'assistant', content: '', loading: false, streaming: false, error: errMsg
+      role: 'assistant', content: '', loading: false, streaming: false, error: errMsg, processSteps: []
     }
     ElMessage.error('AI 响应失败：' + errMsg)
   } finally {
@@ -494,6 +538,47 @@ function abortStream() {
     currentReader = null
   }
   isStreaming.value = false
+}
+
+// ──────────────────────────────────────────
+// 流程步骤识别 + 最终内容渲染
+// ──────────────────────────────────────────
+// 识别流程过程文本（即使 [[PROCESS]] 前缀丢失也能识别）
+// 流程步骤只有两种形态：①"正在…" 进行中 ②"…完成！" 已完成（新增节点只要遵循这两种模板即可自动识别）
+const PROCESS_PATTERNS = [
+  /^\s*正在[^！!。]*[！!。]?\s*$/,   // 进行中：正在意图识别... / 正在查询重写... / 正在理解您的需求...
+  /^\s*[^！!。]*完成[！!。]\s*$/     // 完成：意图识别完成！/ 查询重写完成！/ 数据查询完成！...
+]
+function isProcessStep(text) {
+  const t = text.trim()
+  if (!t) return false
+  return PROCESS_PATTERNS.some(p => p.test(t))
+}
+
+// 从一段（可能是混合的）文本中剥离流程步骤语句，返回 { steps, content }
+function splitProcessFromContent(text) {
+  const steps = []
+  // 按「！」分句，逐句判断是否流程步骤；同时兼容带 [[PROCESS]] 前缀的整段
+  const cleaned = String(text).replace(new RegExp('^' + PROCESS_MARKER, 'g'), '')
+  const sentences = cleaned.split(/(?<=[！!])/)
+  const rest = []
+  for (const s of sentences) {
+    if (isProcessStep(s)) {
+      const t = s.trim()
+      if (t) steps.push(t)
+    } else {
+      rest.push(s)
+    }
+  }
+  return { steps, content: rest.join('').trim() }
+}
+
+// 最终回复渲染：content 已是 HTML（含 <table class="result-table">）或纯文本/简单 markdown。
+// 直接透传 HTML，并做一次安全兜底（剥离可能的 <script>）。
+function renderFinalContent(text) {
+  if (!text) return ''
+  // 后端已保证内容可信（HTML 表格由 McpQueryResultDTO 生成），这里仅做基础脚本防护
+  return String(text).replace(/<script[\s\S]*?<\/script>/gi, '')
 }
 
 // ──────────────────────────────────────────
@@ -907,6 +992,43 @@ function focusInput() {
   font-size: 13px;
 }
 
+/* 流程执行步骤区 */
+.process-steps {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 10px;
+  padding: 9px 12px;
+  background: #f6f8fb;
+  border: 1px solid #ebf0f5;
+  border-radius: 10px;
+  border-left: 3px solid #c9d6e3;
+}
+.process-step {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  font-size: 12.5px;
+  line-height: 1.55;
+  color: #7a8699;
+}
+.step-dot {
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  margin-top: 6px;
+  border-radius: 50%;
+  background: #b8c4d4;
+  transition: background 0.2s;
+}
+.process-step:last-child .step-dot {
+  background: #409eff;
+  box-shadow: 0 0 0 3px rgba(64, 158, 255, 0.15);
+}
+.step-text {
+  word-break: break-word;
+}
+
 /* Markdown 样式 */
 .markdown-body :deep(pre.code-block) {
   background: #1e1e2e;
@@ -931,7 +1053,8 @@ function focusInput() {
   margin: 6px 0;
   padding-left: 20px;
 }
-.markdown-body :deep(table.md-table) {
+.markdown-body :deep(table.md-table),
+.markdown-body :deep(table.result-table) {
   border-collapse: collapse;
   width: 100%;
   margin: 8px 0;
@@ -940,17 +1063,21 @@ function focusInput() {
   border-radius: 8px;
 }
 .markdown-body :deep(table.md-table th),
-.markdown-body :deep(table.md-table td) {
+.markdown-body :deep(table.md-table td),
+.markdown-body :deep(table.result-table th),
+.markdown-body :deep(table.result-table td) {
   border: 1px solid #ebeef5;
   padding: 7px 12px;
   text-align: left;
 }
-.markdown-body :deep(table.md-table th) {
+.markdown-body :deep(table.md-table th),
+.markdown-body :deep(table.result-table th) {
   background: #f5f7fa;
   font-weight: 600;
   color: #1a1a2e;
 }
-.markdown-body :deep(table.md-table tr:nth-child(even) td) {
+.markdown-body :deep(table.md-table tr:nth-child(even) td),
+.markdown-body :deep(table.result-table tr:nth-child(even) td) {
   background: #fafbfc;
 }
 .markdown-body :deep(li) { margin: 3px 0; }
